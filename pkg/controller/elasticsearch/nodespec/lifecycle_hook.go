@@ -47,6 +47,9 @@ PRE_STOP_ADDITIONAL_WAIT_SECONDS=${PRE_STOP_ADDITIONAL_WAIT_SECONDS:=50}
 # terminationGracePeriodSeconds and lead to an incomplete shutdown.
 shutdown_type=${PRE_STOP_SHUTDOWN_TYPE:=restart}
 
+# PRE_STOP_REMOVE_WAIT_SECONDS controls the time to wait for shard migration to complete when shutdown_type is remove.
+PRE_STOP_REMOVE_WAIT_SECONDS=${PRE_STOP_REMOVE_WAIT_SECONDS:=120))}
+
 # capture response bodies in a temp file for better error messages and to extract necessary information for subsequent requests
 resp_body=$(mktemp)
 # shellcheck disable=SC2064
@@ -132,6 +135,70 @@ function delayed_exit() {
   exit "${1-0}"
 }
 
+function shard_draining() {
+  local target_shards
+  local current_shards
+  local elapsed
+
+  # Calculate target shards from auto-expanding indices
+  if ! request -X GET "${ES_URL}/_settings?filter_path=**.settings.index.auto_expand_replicas" "${BASIC_AUTH[@]}"; then
+    error_exit "Failed to fetch index settings."
+  fi
+
+  # Drain the node by excluding it from allocation
+  log "Draining the node: ${NODE_NAME}"
+  if ! request -X PUT "${ES_URL}/_cluster/settings" "${BASIC_AUTH[@]}" -H 'Content-Type: application/json' -d"
+  {
+    \"persistent\": {
+      \"cluster.routing.allocation.exclude._name\": \"${NODE_NAME}\"
+    }
+  }"; then
+    error_exit "Failed to set cluster allocation exclusion."
+  fi
+
+	# No jq
+	# target_shards=$(jq -r 'to_entries[] | select(.value.settings.index.auto_expand_replicas != "false") | .key' "${resp_body}" | wc -l)
+	target_shards=$(grep -o '"auto_expand_replicas":"[^"]*"' "${resp_body}" | grep -v '"auto_expand_replicas":"false"' | wc -l)
+
+  log "Target shard count after draining: ${target_shards}"
+
+	if [[ -z "${target_shards}" || "${target_shards}" -lt 0 ]]; then
+		error_exit "Failed to determine target shard count."
+	fi
+
+  while : ; do
+    elapsed=$(duration "${script_start}")
+    if (( elapsed > PRE_STOP_REMOVE_WAIT_SECONDS )); then
+      error_exit "Timeout reached while waiting for shards to drain."
+    fi
+
+    if ! request -X GET "${ES_URL}/_cat/allocation" "${BASIC_AUTH[@]}"; then
+      error_exit "Failed to fetch allocation details."
+    fi
+
+    current_shards=$(grep "${POD_NAME}" "${resp_body}" | awk '{print $2}')
+
+    if (( current_shards <= target_shards )); then
+      log "Shard migration completed."
+      break
+    fi
+
+    log "Waiting for shard migration. Current: ${current_shards}, Target: ${target_shards}"
+    sleep 30
+  done
+
+  # Reset the exclusion setting before exiting
+  log "Resetting cluster allocation exclusion for node: ${NODE_NAME}"
+  if ! request -X PUT "${ES_URL}/_cluster/settings" "${BASIC_AUTH[@]}" -H 'Content-Type: application/json' -d"
+  {
+    \"persistent\": {
+      \"cluster.routing.allocation.exclude._name\": \"\"
+    }
+  }"; then
+    error_exit "Failed to reset cluster allocation exclusion."
+  fi
+}
+
 function supports_node_shutdown() {
   local version="$1"
   version="${version#[vV]}"
@@ -201,6 +268,12 @@ if ! retry "$retries_count" request -X PUT "${ES_URL}/_nodes/${NODE_ID}/shutdown
 }"
 then
   error_exit "failed to call node shutdown API"
+fi
+
+# in case of remove, we need to wait for the shard migration to complete
+if [[ "${shutdown_type}" == "remove" ]]; then
+  log "Handling shard migration due to shutdown type: remove"
+  shard_draining
 fi
 
 while :
